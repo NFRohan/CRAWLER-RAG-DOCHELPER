@@ -1,9 +1,12 @@
 import os
+from typing import List, Dict, Any
 from dotenv import load_dotenv
-from langchain_pinecone import PineconeVectorStore
+from pinecone import Pinecone
+from pinecone_text.sparse import BM25Encoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 from langchain_cohere.rerank import CohereRerank
@@ -12,25 +15,107 @@ from langchain_cohere.rerank import CohereRerank
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in .env file")
 if not COHERE_API_KEY:
     raise ValueError("COHERE_API_KEY not found in .env file")
+if not PINECONE_API_KEY:
+    raise ValueError("PINECONE_API_KEY not found in .env file")
 
-# --- 1. Setup Embeddings ---
+# --- Configuration ---
+INDEX_NAME = "doc-helper-index"
+BM25_PARAMS_FILE = "bm25_params.json"
+
+# --- 1. Setup Dense Embeddings ---
 embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L12-v2", model_kwargs={"device": "cpu"})
-
-# --- 2. Setup Vector Store & Retriever ---
-vector_store = PineconeVectorStore(
-    index_name="doc-helper-index",
-    embedding=embeddings,
+    model_name="sentence-transformers/all-MiniLM-L12-v2", 
+    model_kwargs={"device": "cpu"}
 )
-retriever = vector_store.as_retriever(
-    search_type="similarity", search_kwargs={"k": 20}) # Increased k for more comprehensive reranking
 
-# --- 3. Setup Reranker ---
-reranker = CohereRerank(model="rerank-english-v2.0")
+# --- 2. Setup Sparse Encoder (BM25) ---
+bm25_encoder = BM25Encoder()
+if os.path.exists(BM25_PARAMS_FILE):
+    bm25_encoder.load(BM25_PARAMS_FILE)
+else:
+    raise FileNotFoundError(
+        f"BM25 parameters file '{BM25_PARAMS_FILE}' not found. "
+        "Please run ingestion.py first to train the BM25 encoder."
+    )
+
+# --- 3. Setup Pinecone Client ---
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(INDEX_NAME)
+
+
+# --- 4. Hybrid Search Function ---
+def hybrid_search(
+    query: str, 
+    top_k: int = 20, 
+    alpha: float = 0.5
+) -> List[Document]:
+    """
+    Perform hybrid search combining dense (semantic) and sparse (BM25) vectors.
+    
+    Args:
+        query: The search query string
+        top_k: Number of results to return
+        alpha: Weight for dense vs sparse (0=sparse only, 1=dense only, 0.5=balanced)
+    
+    Returns:
+        List of LangChain Document objects with search results
+    """
+    # Generate dense embedding for query
+    dense_query = embeddings.embed_query(query)
+    
+    # Generate sparse vector for query using BM25
+    sparse_query_dict = bm25_encoder.encode_queries([query])[0]
+    sparse_query = {
+        "indices": sparse_query_dict["indices"],
+        "values": sparse_query_dict["values"]
+    }
+    
+    # Scale vectors based on alpha (hybrid weighting)
+    # alpha = 1: pure dense/semantic search
+    # alpha = 0: pure sparse/keyword search
+    # alpha = 0.5: balanced hybrid
+    scaled_dense = [v * alpha for v in dense_query]
+    scaled_sparse = {
+        "indices": sparse_query["indices"],
+        "values": [v * (1 - alpha) for v in sparse_query["values"]]
+    }
+    
+    # Perform hybrid query
+    results = index.query(
+        vector=scaled_dense,
+        sparse_vector=scaled_sparse,
+        top_k=top_k,
+        include_metadata=True
+    )
+    
+    # Convert to LangChain Documents
+    documents = []
+    for match in results.matches:
+        doc = Document(
+            page_content=match.metadata.get("text", ""),
+            metadata={
+                "source": match.metadata.get("source", "unknown"),
+                "score": match.score
+            }
+        )
+        documents.append(doc)
+    
+    return documents
+
+
+def hybrid_retriever(query: str) -> List[Document]:
+    """Wrapper function for hybrid search to use in LangChain chain."""
+    return hybrid_search(query, top_k=20, alpha=0.5)
+
+
+# --- 5. Setup Reranker ---
+reranker = CohereRerank(model="rerank-english-v3.0")
 
 def rerank_docs(input_dict):
     reranked_docs = reranker.compress_documents(
@@ -41,14 +126,14 @@ def rerank_docs(input_dict):
     input_dict["context_docs"] = reranked_docs
     return input_dict
 
-# --- 4. Setup LLM ---
+# --- 6. Setup LLM ---
 llm = ChatGoogleGenerativeAI(
     google_api_key=GEMINI_API_KEY,
     model="gemini-2.5-flash",
-    temperature=0.2,
+    temperature=0.3,
 )
 
-# --- 4. Setup Prompt ---
+# --- 7. Setup Prompt ---
 template = """
 You are a helpful assistant for the LangChain documentation.
 Answer the question based *only* on the following context.
@@ -64,7 +149,7 @@ Answer:
 """
 prompt = ChatPromptTemplate.from_template(template)
 
-# --- 5. Helper Function ---
+# --- 8. Helper Function ---
 def format_docs(docs):
     return "\n\n".join(
         f"--- Document {i+1} (Source: {doc.metadata.get('source', 'unknown')}) ---\n{doc.page_content}"
@@ -72,22 +157,18 @@ def format_docs(docs):
     )
 
 # ===================================================================
-# === THIS IS THE 'KNOWN GOOD' RAG CHAIN DEFINITION ===
-# =Details:
-# 1. `rag_chain_input` is a dict that runs two things in parallel.
-# 2. It pipes its output (a dict) to `RunnablePassthrough.assign()`.
-# 3. `.assign()` passes through the original dict keys AND adds a new 'answer' key.
-# 4. The 'answer' key is created by running its own sub-chain.
+# === HYBRID SEARCH RAG CHAIN ===
+# Uses Sparse-Dense hybrid retrieval for better keyword + semantic search
 # ===================================================================
 
 # This is the "input" step for our chain.
-# It runs the retriever and passthrough in parallel.
+# It runs the hybrid retriever and passthrough in parallel.
 rag_chain_input = {
-    "context_docs": retriever,
+    "context_docs": RunnableLambda(hybrid_retriever),
     "question": RunnablePassthrough()
 }
 
-# This is the full chain with reranking.
+# This is the full chain with hybrid search and reranking.
 rag_chain = (
     rag_chain_input
     # Rerank the documents based on the question
@@ -107,11 +188,16 @@ rag_chain = (
     )
 )
 
-# --- 6. Run the Chain ---
+# --- 9. Run the Chain ---
 if __name__ == "__main__":
+    print("=" * 60)
+    print("🔍 HYBRID SEARCH RAG SYSTEM")
+    print("   Using Sparse-Dense vectors for keyword + semantic search")
+    print("=" * 60)
+    
     question = "What is the simplest way to get started with LangChain?"
 
-    print(f"Querying RAG chain with: '{question}'")
+    print(f"\nQuerying RAG chain with: '{question}'")
 
     # We are using .invoke() - NOT .stream()
     result = rag_chain.invoke(question)
@@ -127,7 +213,8 @@ if __name__ == "__main__":
 
     # --- Example 2 ---
     question_2 = "What is langchain?"
-    print(f"\nQuerying RAG chain with: '{question_2}'")
+    print(f"\n{'=' * 60}")
+    print(f"Querying RAG chain with: '{question_2}'")
 
     result_2 = rag_chain.invoke(question_2)
 
